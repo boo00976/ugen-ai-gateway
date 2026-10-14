@@ -1,8 +1,11 @@
+from typing import Any, cast
+
 from openai.types.chat import ChatCompletionMessageParam
 
 from ugen_ai_gateway.analysis.analyzer import RequestAnalyzer
+from ugen_ai_gateway.analysis.pii import redact_personal_data
 from ugen_ai_gateway.analysis.policy import RoutingPolicy
-from ugen_ai_gateway.api.schemas import ChatRequest, ChatResponse
+from ugen_ai_gateway.api.schemas import ChatRequest, ChatResponse, RoutingInfo
 from ugen_ai_gateway.config import Settings
 from ugen_ai_gateway.providers.cloud import CloudProvider
 from ugen_ai_gateway.providers.local import LocalProvider
@@ -62,7 +65,30 @@ class GatewayService:
                 f"No model configured for the {decision.provider} provider"
             )
 
-        messages: list[ChatCompletionMessageParam] = request.messages
+        messages: list[ChatCompletionMessageParam] = []
+        for message in request.messages:
+            message_data = cast(dict[str, Any], message)
+            redacted_message = message_data.copy()
+            content = redacted_message.get("content")
+            if isinstance(content, str):
+                redacted_message["content"] = redact_personal_data(content)
+            elif content is not None and not isinstance(content, dict):
+                redacted_parts = []
+                for part in content:
+                    if not isinstance(part, dict):
+                        redacted_parts.append(part)
+                        continue
+
+                    redacted_part = part.copy()
+                    if isinstance(redacted_part.get("text"), str):
+                        redacted_part["text"] = redact_personal_data(
+                            redacted_part["text"]
+                        )
+                    redacted_parts.append(redacted_part)
+
+                redacted_message["content"] = redacted_parts
+
+            messages.append(cast(ChatCompletionMessageParam, redacted_message))
 
         completion = await provider.complete(
             model=model,
@@ -78,8 +104,18 @@ class GatewayService:
         if not isinstance(content, str):
             raise TypeError("Model provider returned no text content")
 
+        routing = RoutingInfo(
+            complexity=analysis.complexity,
+            task_type=analysis.task_type,
+            contains_personal_data=analysis.contains_personal_data,
+            personal_data_types=analysis.personal_data_types,
+            provider=decision.provider,
+            reason=decision.reason,
+        )
+
         return ChatResponse(
             model=completion.model,
             content=content,
             provider=decision.provider,
+            routing=routing,
         )
